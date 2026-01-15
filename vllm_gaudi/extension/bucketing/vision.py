@@ -19,6 +19,10 @@ MULTIMODAL_CONFIG = {
         'is_batch_based': False,
         'buckets': [1600, 3136, 4096, 6400, 7744, 9216, 12544]
     },
+    'qwen2_vl': {
+        'is_batch_based': False,
+        'buckets': [1600, 3136, 4096, 6400, 7744, 9216, 12544]
+    },
     'qwen3_vl': {
         'is_batch_based': False,
         #coverage for lmarena-ai/VisionArena-Chat
@@ -47,6 +51,9 @@ class HPUVisionBucketManager:
             else:
                 multimodal_buckets = [int(x) for x in envvar.split(',')]
             self.multimodal_buckets = self._process_buckets(multimodal_buckets)
+        self.graphed_buckets: Set[Any] = set()
+        self.skip_warmup = os.environ.get('VLLM_SKIP_WARMUP',
+                                          'false').lower() == 'true'
 
     def _get_multimodal_config(self, model_name):
         """Get configuration for model"""
@@ -163,3 +170,10 @@ class HPUVisionBucketManager:
 
     def __repr__(self):
         return str(self.multimodal_buckets)
+
+    def use_graph(self, seq_len):
+        if self.skip_warmup and \
+           self.multimodal_buckets is not None and \
+           seq_len in self.multimodal_buckets:
+            return True
+        return seq_len in self.graphed_buckets
