@@ -134,16 +134,12 @@ class HPUQwen2VisionAttention(Qwen2VisionAttention):
         )
         q, k = torch.chunk(qk_rotated, 2, dim=0)
 
-        fullatt_block_attn_mask = cu_seqlens
         q1, k1, v1 = (rearrange(x, "b s h d -> b h s d")
                         for x in [q, k, v])
         (batch_size, _, seq_len_N_t, _) = q1.shape
         (batch_size, _, seq_len_N_s, _) = k1.shape
-        mask_shape = (batch_size, 1, seq_len_N_t, seq_len_N_s)
-        attn_mask = fullatt_block_attn_mask.reshape(
-            batch_size, 1, seq_len_N_t, seq_len_N_s,
-            -1)[:, :, :, :, 0]  # reshapes the mask to be Bx1xNxN
-        assert attn_mask.shape == mask_shape
+
+        attn_mask = cu_seqlens if cu_seqlens is not None else None
 
         if q1.shape[2] <= 65536:  # need to investigate this crosspoint
             fused_out = FusedSDPA.apply(q1, k1, v1, attn_mask, 0.0, False,
@@ -238,6 +234,7 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
             prefix=prefix,
         )
         self.spatial_merge_unit = self.spatial_merge_size**2
+        self.compose_seq_len = 1024
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         embed_dim = vision_config.embed_dim
@@ -257,8 +254,11 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
             ) for layer_idx in range(depth)
         ])
 
-    def pad_multimodal_data(self, pixel_values, image_grid_thw,
-                            vision_buckets):
+    def pad_multimodal_data(self,
+                            pixel_values,
+                            image_grid_thw,
+                            vision_buckets,
+                            constant_value=0):
         assert pixel_values.shape[0] % 4 == 0, 'needs 64 aligned resolution'
 
         desired_number_of_pixels = vision_buckets.get_multimodal_bucket(
@@ -273,7 +273,6 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
             + str(desired_number_of_pixels)
         logger.debug(logger_msg)
 
-        constant_value = -100
         pixel_values = torch.cat([
             pixel_values,
             torch.ones((padding_len, pixel_values.shape[1]), \
@@ -286,7 +285,6 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
                          device=image_grid_thw.device)
         ])
 
-        assert image_grid_thw.prod(-1).sum() == desired_number_of_pixels
         return pixel_values, image_grid_thw
 
     def pre_attn(self, x: torch.Tensor, grid_thw: torch.Tensor):
@@ -332,10 +330,44 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
 
         offset = 0
         results = []
+        calc_img_size = 0
+        calc_img_len_list = []
+        calc_grid_thw_list = []
         # process each image one by one
         for img_idx in range(grid_thw.shape[0]):
             img_shape = grid_thw[img_idx, :].unsqueeze(0)
             curr_img_size = img_shape.prod()
+            attn_mask = None
+            next_img_size = 100000
+            if img_idx < grid_thw.shape[0] - 1:
+                img_shape_next = grid_thw[img_idx + 1, :].unsqueeze(0)
+                next_img_size = img_shape_next.prod()
+
+            calc_img_size += curr_img_size
+            calc_img_len_list.append(curr_img_size)
+            calc_grid_thw_list.append(img_shape)
+            if calc_img_size + next_img_size < self.compose_seq_len:
+                #compose small images SDPA into one bigger SDPA with mask
+                continue
+            else:
+                curr_img_size = calc_img_size
+                calc_img_size = 0
+                if len(calc_img_len_list) > 1:
+                    bucket_img_size = vision_buckets.get_multimodal_bucket(
+                        curr_img_size)
+                    attn_mask = torch.zeros(bucket_img_size,
+                                            bucket_img_size).bool()
+                    img_start = 0
+                    for img_len in calc_img_len_list:
+                        img_end = img_start + img_len
+                        attn_mask[img_start:img_end, img_start:img_end] = True
+                        img_start = img_end
+
+                    img_shape = torch.cat(calc_grid_thw_list)
+
+                    attn_mask = attn_mask.to(device=self.device)
+                calc_img_len_list = []
+                calc_grid_thw_list = []
 
             pixel_values_curr_img = pixel_values[offset:offset +
                                                  curr_img_size, :]
@@ -343,17 +375,12 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
             offset += curr_img_size
             pixel_values_curr_img_padded, img_shape_padded = \
                 self.pad_multimodal_data(pixel_values_curr_img, \
-                    img_shape, vision_buckets=vision_buckets)
+                    img_shape, vision_buckets=vision_buckets,constant_value=0)
 
             pixel_values_curr_img_padded, rot_pos_emb_cos, rot_pos_emb_sin, \
                 cu_seqlens = self.pre_attn(
             pixel_values_curr_img_padded, img_shape_padded)
 
-            # Create full attention block mask
-            # before VisionTransformer to save memory/time
-            fullatt_block_attn_mask = \
-                create_block_diagonal_attention_mask_outerprod \
-                    (cu_seqlens)
             assert pixel_values_curr_img_padded.shape[0] == \
                  rot_pos_emb_cos.shape[0] == rot_pos_emb_sin.shape[0]
 
@@ -366,7 +393,7 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
 
             htcore.mark_step()
             hidden_states = self.forward(pixel_values_curr_img_padded,
-                                         fullattn_mask=fullatt_block_attn_mask,
+                                         fullattn_mask=attn_mask,
                                          rotary_pos_emb_cos=rot_pos_emb_cos,
                                          rotary_pos_emb_sin=rot_pos_emb_sin,
                                          **extra_forward_kwargs)
@@ -374,7 +401,7 @@ class Qwen2VisionTransformerStaticShape(Qwen2VisionTransformer):
 
             image_embeds = self.post_attn(hidden_states)
             # slice image_embeds to remove the padded parts
-            pad_index = img_shape_padded[0].prod() // self.spatial_merge_unit
+            pad_index = curr_img_size// self.spatial_merge_unit
             results += [image_embeds[:pad_index, :]]
         results_cat = torch.concat(results)
         image_embeds = results_cat
